@@ -17,24 +17,29 @@ import {
   Volume2,
   VolumeX,
   X,
+  RotateCcw,
 } from "lucide-react";
 import type { PageId } from "@/components/Layout";
 
 type TimerState = "idle" | "running" | "paused" | "completed";
 
-export function Focus({ onNavigate }: { onNavigate: (page: PageId) => void }) {
+export function Focus({ onNavigate }: { onNavigate: (pageId: PageId) => void }) {
   const { session } = useAuth();
   const [tasks, setTasks] = useState<TaskWithCompletion[]>([]);
   const [selectedTaskId, setSelectedTaskId] = useState<string>("");
   const [mode, setMode] = useState<SessionMode>("custom");
-  const [targetSeconds, setTargetSeconds] = useState(25 * 60);
+  const [targetMinutes, setTargetMinutes] = useState(25);
   const [elapsed, setElapsed] = useState(0);
   const [timerState, setTimerState] = useState<TimerState>("idle");
   const [focusMode, setFocusMode] = useState(false);
   const [soundEnabled, setSoundEnabled] = useState(true);
   const [saving, setSaving] = useState(false);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const sirenTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const sessionStartRef = useRef<number | null>(null);
+
+  const targetSeconds = targetMinutes * 60;
 
   const load = useCallback(async () => {
     if (!session) return;
@@ -49,58 +54,138 @@ export function Focus({ onNavigate }: { onNavigate: (page: PageId) => void }) {
     load();
   }, [load]);
 
-  // Timer tick
+  // Timer tick — uses wall-clock time for accuracy
   useEffect(() => {
-    if (timerState === "running") {
-      intervalRef.current = setInterval(() => {
-        setElapsed((prev) => {
-          const next = prev + 1;
-          if (mode === "pomodoro" && next >= targetSeconds) {
-            return targetSeconds;
-          }
-          return next;
-        });
-      }, 1000);
-    } else {
+    if (timerState !== "running") {
       if (intervalRef.current) {
         clearInterval(intervalRef.current);
         intervalRef.current = null;
       }
+      return;
     }
+
+    const startTime = sessionStartRef.current ?? Date.now();
+    const startElapsed = elapsed;
+
+    intervalRef.current = setInterval(() => {
+      const now = Date.now();
+      const newElapsed = startElapsed + Math.floor((now - startTime) / 1000);
+
+      if (mode === "pomodoro" && newElapsed >= targetSeconds) {
+        setElapsed(targetSeconds);
+      } else {
+        setElapsed(newElapsed);
+      }
+    }, 250);
+
     return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [timerState, mode, targetSeconds]);
 
-  // Check completion
+  // Completion check for pomodoro
   useEffect(() => {
     if (mode === "pomodoro" && elapsed >= targetSeconds && timerState === "running") {
       setTimerState("completed");
-      if (soundEnabled) playBeep();
     }
-  }, [elapsed, targetSeconds, mode, timerState, soundEnabled]);
+  }, [elapsed, targetSeconds, mode, timerState]);
 
-  function playBeep() {
+  // Play siren when timer completes
+  useEffect(() => {
+    if (timerState === "completed" && soundEnabled) {
+      playSiren();
+    } else {
+      stopSiren();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [timerState, soundEnabled]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      stopSiren();
+      if (intervalRef.current) clearInterval(intervalRef.current);
+    };
+  }, []);
+
+  function playSiren() {
+    stopSiren();
     try {
-      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const ctx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+      audioCtxRef.current = ctx;
+
+      // If audio context is suspended (browser autoplay policy), resume it
+      if (ctx.state === "suspended") {
+        ctx.resume();
+      }
+
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.connect(gain);
       gain.connect(ctx.destination);
-      osc.frequency.value = 800;
-      gain.gain.setValueAtTime(0.3, ctx.currentTime);
+
+      osc.type = "sawtooth";
+      gain.gain.setValueAtTime(0.0001, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.4, ctx.currentTime + 0.1);
+
+      // Siren: sweep frequency up and down repeatedly
+      let direction = 1;
+      let currentFreq = 600;
+      const minFreq = 500;
+      const maxFreq = 1200;
+
+      sirenTimerRef.current = setInterval(() => {
+        const c = audioCtxRef.current;
+        if (!c) return;
+        currentFreq += direction * 80;
+        if (currentFreq >= maxFreq) {
+          currentFreq = maxFreq;
+          direction = -1;
+        } else if (currentFreq <= minFreq) {
+          currentFreq = minFreq;
+          direction = 1;
+        }
+        try {
+          osc.frequency.setValueAtTime(currentFreq, c.currentTime);
+        } catch {
+          // oscillator may have been stopped
+        }
+      }, 100);
+
       osc.start();
-      setTimeout(() => {
-        osc.stop();
+    } catch {
+      // Audio not available
+    }
+  }
+
+  function stopSiren() {
+    if (sirenTimerRef.current) {
+      clearInterval(sirenTimerRef.current);
+      sirenTimerRef.current = null;
+    }
+    const ctx = audioCtxRef.current;
+    if (ctx) {
+      try {
+        // Close all active oscillators/nodes
         ctx.close();
-      }, 300);
-    } catch {}
+      } catch {
+        // already closed
+      }
+      audioCtxRef.current = null;
+    }
   }
 
   function handleStart() {
     if (timerState === "idle" || timerState === "completed") {
       setElapsed(0);
       sessionStartRef.current = Date.now();
+    } else if (timerState === "paused") {
+      // Adjust session start for the resumed elapsed time
+      sessionStartRef.current = Date.now() - elapsed * 1000;
     }
     setTimerState("running");
     setFocusMode(true);
@@ -111,30 +196,35 @@ export function Focus({ onNavigate }: { onNavigate: (page: PageId) => void }) {
   }
 
   function handleResume() {
+    sessionStartRef.current = Date.now() - elapsed * 1000;
     setTimerState("running");
   }
 
   async function handleStop() {
+    stopSiren();
     if (elapsed > 0) {
       setSaving(true);
       try {
+        const startedAt = new Date(Date.now() - elapsed * 1000).toISOString();
         await saveStudySession({
           task_id: selectedTaskId || null,
           session_date: getTodayDate(),
-          started_at: new Date(sessionStartRef.current || Date.now() - elapsed * 1000).toISOString(),
+          started_at: startedAt,
           ended_at: new Date().toISOString(),
           duration_seconds: elapsed,
           mode,
         });
         await saveFocusSession({
           task_id: selectedTaskId || null,
-          started_at: new Date(sessionStartRef.current || Date.now() - elapsed * 1000).toISOString(),
+          started_at: startedAt,
           ended_at: new Date().toISOString(),
           duration_seconds: elapsed,
           was_interrupted: false,
         });
         await load();
-      } catch {}
+      } catch {
+        // session save failed, but still reset UI
+      }
       setSaving(false);
     }
     setTimerState("idle");
@@ -144,21 +234,23 @@ export function Focus({ onNavigate }: { onNavigate: (page: PageId) => void }) {
   }
 
   async function handleComplete() {
+    stopSiren();
     if (!session || !selectedTaskId) return;
     setSaving(true);
     try {
       if (elapsed > 0) {
+        const startedAt = new Date(Date.now() - elapsed * 1000).toISOString();
         await saveStudySession({
           task_id: selectedTaskId,
           session_date: getTodayDate(),
-          started_at: new Date(sessionStartRef.current || Date.now() - elapsed * 1000).toISOString(),
+          started_at: startedAt,
           ended_at: new Date().toISOString(),
           duration_seconds: elapsed,
           mode,
         });
         await saveFocusSession({
           task_id: selectedTaskId,
-          started_at: new Date(sessionStartRef.current || Date.now() - elapsed * 1000).toISOString(),
+          started_at: startedAt,
           ended_at: new Date().toISOString(),
           duration_seconds: elapsed,
           was_interrupted: false,
@@ -170,25 +262,38 @@ export function Focus({ onNavigate }: { onNavigate: (page: PageId) => void }) {
       setElapsed(0);
       setFocusMode(false);
       sessionStartRef.current = null;
-    } catch {}
+    } catch {
+      // completion failed
+    }
     setSaving(false);
+  }
+
+  function handleReset() {
+    stopSiren();
+    setTimerState("idle");
+    setElapsed(0);
+    sessionStartRef.current = null;
   }
 
   const selectedTask = tasks.find((t) => t.id === selectedTaskId);
   const remaining = mode === "pomodoro" ? Math.max(targetSeconds - elapsed, 0) : 0;
   const displayTime = mode === "pomodoro" ? formatTimer(remaining) : formatTimer(elapsed);
-  const progress = mode === "pomodoro" && targetSeconds > 0 ? (elapsed / targetSeconds) * 100 : 0;
+  const progress =
+    mode === "pomodoro" && targetSeconds > 0 ? (elapsed / targetSeconds) * 100 : 0;
 
   // Focus Mode UI (Do Not Disturb style)
   if (focusMode) {
     const msgKey = timerState === "completed" ? "completed" : "in_progress";
-    const msgs = MOTIVATIONAL_MESSAGES[msgKey];
+    const msgs = MOTIVATIONAL_MESSAGES[msgKey] || MOTIVATIONAL_MESSAGES.in_progress;
     const motivation = msgs[Math.floor((Date.now() / 10000) % msgs.length)];
 
     return (
       <div className="fixed inset-0 z-50 bg-gray-950 text-white flex flex-col items-center justify-center px-6 animate-[fadeIn_0.3s_ease-out]">
         <button
-          onClick={() => setFocusMode(false)}
+          onClick={() => {
+            stopSiren();
+            setFocusMode(false);
+          }}
           className="absolute top-4 right-4 p-2 rounded-lg text-gray-500 hover:text-white hover:bg-gray-800 transition-colors"
         >
           <X size={24} />
@@ -209,17 +314,19 @@ export function Focus({ onNavigate }: { onNavigate: (page: PageId) => void }) {
           {/* Timer */}
           <div className="relative">
             {mode === "pomodoro" && (
-              <svg className="absolute inset-0 -rotate-90" viewBox="0 0 200 200">
+              <svg className="absolute inset-0 -rotate-90 mx-auto" viewBox="0 0 200 200" style={{ width: "200px", height: "200px", left: "50%", transform: "translateX(-50%) rotate(-90deg)" }}>
                 <circle cx="100" cy="100" r="90" fill="none" stroke="rgb(31,41,55)" strokeWidth="6" />
                 <circle
-                  cx="100" cy="100" r="90" fill="none" stroke="rgb(59,130,246)" strokeWidth="6"
+                  cx="100" cy="100" r="90" fill="none"
+                  stroke={timerState === "completed" ? "rgb(16,185,129)" : "rgb(59,130,246)"}
+                  strokeWidth="6"
                   strokeLinecap="round"
                   strokeDasharray={`${(progress / 100) * 565.5} 565.5`}
                   className="transition-all duration-1000 ease-linear"
                 />
               </svg>
             )}
-            <div className={`text-7xl font-bold font-mono tabular-nums ${mode === "pomodoro" ? "py-12" : ""}`}>
+            <div className={`text-7xl font-bold font-mono tabular-nums ${mode === "pomodoro" ? "py-12" : ""} ${timerState === "completed" ? "text-emerald-400" : ""}`}>
               {displayTime}
             </div>
           </div>
@@ -229,7 +336,7 @@ export function Focus({ onNavigate }: { onNavigate: (page: PageId) => void }) {
               <p className="text-lg text-emerald-400 font-semibold">Pomodoro Complete!</p>
               <p className="text-sm text-gray-400">{motivation}</p>
               <div className="flex gap-3 justify-center">
-                <Button variant="secondary" onClick={handleStop} size="lg">
+                <Button variant="secondary" onClick={handleStop} size="lg" disabled={saving}>
                   Save & Exit
                 </Button>
                 <Button onClick={handleComplete} size="lg" disabled={saving || !selectedTaskId}>
@@ -237,6 +344,12 @@ export function Focus({ onNavigate }: { onNavigate: (page: PageId) => void }) {
                   Mark Task Done
                 </Button>
               </div>
+              <button
+                onClick={handleReset}
+                className="text-xs text-gray-500 hover:text-gray-300 flex items-center gap-1 justify-center mx-auto"
+              >
+                <RotateCcw size={12} /> Restart Timer
+              </button>
             </div>
           )}
 
@@ -300,7 +413,7 @@ export function Focus({ onNavigate }: { onNavigate: (page: PageId) => void }) {
           </label>
           <Select value={selectedTaskId} onChange={(e) => setSelectedTaskId(e.target.value)}>
             {tasks.length === 0 ? (
-              <option value="">No tasks available</option>
+              <option value="">No tasks available — create tasks first</option>
             ) : (
               tasks.map((t) => (
                 <option key={t.id} value={t.id}>
@@ -360,9 +473,9 @@ export function Focus({ onNavigate }: { onNavigate: (page: PageId) => void }) {
             {[15, 25, 50].map((min) => (
               <button
                 key={min}
-                onClick={() => { setTargetSeconds(min * 60); setTimerState("idle"); setElapsed(0); }}
+                onClick={() => { setTargetMinutes(min); setTimerState("idle"); setElapsed(0); }}
                 className={`flex-1 py-2 rounded-lg text-sm font-medium transition-colors ${
-                  targetSeconds === min * 60
+                  targetMinutes === min
                     ? "bg-blue-500/20 text-blue-600 dark:text-blue-400 ring-1 ring-blue-500/30"
                     : "bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400"
                 }`}
@@ -376,9 +489,9 @@ export function Focus({ onNavigate }: { onNavigate: (page: PageId) => void }) {
             {[10, 30, 60, 90].map((min) => (
               <button
                 key={min}
-                onClick={() => { setTargetSeconds(min * 60); setTimerState("idle"); setElapsed(0); }}
+                onClick={() => { setTargetMinutes(min); setTimerState("idle"); setElapsed(0); }}
                 className={`flex-1 py-2 rounded-lg text-sm font-medium transition-colors ${
-                  targetSeconds === min * 60
+                  targetMinutes === min
                     ? "bg-blue-500/20 text-blue-600 dark:text-blue-400 ring-1 ring-blue-500/30"
                     : "bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400"
                 }`}
@@ -391,7 +504,9 @@ export function Focus({ onNavigate }: { onNavigate: (page: PageId) => void }) {
 
         {/* Timer display */}
         <div className="text-center py-6">
-          <div className="text-5xl font-bold font-mono tabular-nums text-gray-900 dark:text-white">
+          <div className={`text-5xl font-bold font-mono tabular-nums ${
+            timerState === "completed" ? "text-emerald-500 dark:text-emerald-400" : "text-gray-900 dark:text-white"
+          }`}>
             {mode === "pomodoro" ? formatTimer(remaining) : formatTimer(elapsed)}
           </div>
           <p className="text-xs text-gray-400 mt-2">
@@ -407,7 +522,7 @@ export function Focus({ onNavigate }: { onNavigate: (page: PageId) => void }) {
           {timerState === "idle" || timerState === "completed" ? (
             <Button onClick={handleStart} size="lg" className="flex-1" disabled={tasks.length === 0}>
               <Play size={20} />
-              Start Focus
+              {timerState === "completed" ? "Start Again" : "Start Focus"}
             </Button>
           ) : timerState === "running" ? (
             <>
@@ -435,10 +550,18 @@ export function Focus({ onNavigate }: { onNavigate: (page: PageId) => void }) {
         </div>
 
         {timerState === "completed" && (
-          <Button onClick={handleComplete} variant="success" size="lg" className="w-full" disabled={saving || !selectedTaskId}>
-            <Check size={20} />
-            Mark Task as Completed
-          </Button>
+          <div className="space-y-2">
+            <Button onClick={handleComplete} variant="success" size="lg" className="w-full" disabled={saving || !selectedTaskId}>
+              <Check size={20} />
+              Mark Task as Completed
+            </Button>
+            <button
+              onClick={handleReset}
+              className="text-xs text-gray-500 hover:text-gray-400 flex items-center gap-1 justify-center w-full"
+            >
+              <RotateCcw size={12} /> Reset Timer
+            </button>
+          </div>
         )}
       </Card>
 
